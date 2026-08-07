@@ -8,7 +8,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2/ktesting"
 
 	clusterfake "open-cluster-management.io/api/client/cluster/clientset/versioned/fake"
@@ -110,14 +109,8 @@ func TestOnClusterChange(t *testing.T) {
 				clusterInformerFactory.Cluster().V1beta1().Placements(),
 				clusterInformerFactory.Cluster().V1beta2().ManagedClusterSetBindings(),
 			)
-			queuedKeys := sets.NewString()
-			fakeEnqueuePlacement := func(obj interface{}, queue workqueue.TypedRateLimitingInterface[string]) {
-				key, _ := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-				queuedKeys.Insert(key)
-			}
-			q.enqueuePlacementFunc = fakeEnqueuePlacement
-
 			q.enqueueCluster(c.obj)
+			queuedKeys := drainPlacementQueue(t, q)
 			expectedQueuedKeys := sets.NewString(c.queuedKeys...)
 			if !queuedKeys.Equal(expectedQueuedKeys) {
 				t.Errorf("expected queued placements %q, but got %s", strings.Join(expectedQueuedKeys.List(), ","), strings.Join(queuedKeys.List(), ","))
@@ -274,17 +267,12 @@ func TestOnClusterUpdate(t *testing.T) {
 				clusterInformerFactory.Cluster().V1beta1().Placements(),
 				clusterInformerFactory.Cluster().V1beta2().ManagedClusterSetBindings(),
 			)
-			queuedKeys := sets.NewString()
-			fakeEnqueuePlacement := func(obj interface{}, queue workqueue.TypedRateLimitingInterface[string]) {
-				key, _ := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-				queuedKeys.Insert(key)
-			}
-			q.enqueuePlacementFunc = fakeEnqueuePlacement
 			handler := &clusterEventHandler{
 				enqueuer: q,
 			}
 
 			handler.OnUpdate(c.oldObj, c.newObj)
+			queuedKeys := drainPlacementQueue(t, q)
 			expectedQueuedKeys := sets.NewString(c.queuedKeys...)
 			if !queuedKeys.Equal(expectedQueuedKeys) {
 				t.Errorf("expected queued placements %q, but got %s", strings.Join(expectedQueuedKeys.List(), ","), strings.Join(queuedKeys.List(), ","))
@@ -378,17 +366,12 @@ func TestOnClusterDelete(t *testing.T) {
 				clusterInformerFactory.Cluster().V1beta1().Placements(),
 				clusterInformerFactory.Cluster().V1beta2().ManagedClusterSetBindings(),
 			)
-			queuedKeys := sets.NewString()
-			fakeEnqueuePlacement := func(obj interface{}, queue workqueue.TypedRateLimitingInterface[string]) {
-				key, _ := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-				queuedKeys.Insert(key)
-			}
-			q.enqueuePlacementFunc = fakeEnqueuePlacement
 			handler := &clusterEventHandler{
 				enqueuer: q,
 			}
 
 			handler.OnDelete(c.obj)
+			queuedKeys := drainPlacementQueue(t, q)
 			expectedQueuedKeys := sets.NewString(c.queuedKeys...)
 			if !queuedKeys.Equal(expectedQueuedKeys) {
 				t.Errorf("expected queued placements %q, but got %s", strings.Join(expectedQueuedKeys.List(), ","), strings.Join(queuedKeys.List(), ","))

@@ -175,6 +175,20 @@ var _ = ginkgo.Describe("Placement", func() {
 				[]clusterapiv1beta1.DecisionGroupStatus{{Decisions: []string{testinghelpers.PlacementDecisionName(placementName, 1)}, ClustersCount: 0}})
 		})
 
+		ginkgo.It("Should schedule when dependencies are created out of order", func() {
+			placement := testinghelpers.NewPlacement(namespace, placementName).Build()
+			assertCreatingPlacementWithDecision(placement, 0, 1)
+
+			// Create the namespaced binding and cluster before the referenced cluster set.
+			// This exercises informer event ordering across independent resource caches.
+			assertCreatingClusterSetBinding(clusterSet1Name, namespace)
+			assertCreatingClusters(clusterSet1Name, 1)
+			assertCreatingClusterSet(clusterSet1Name)
+
+			assertPlacementDecisionNumbers(placementName, namespace, 1, 1)
+			assertPlacementConditionSatisfied(placementName, namespace, 1, true)
+		})
+
 		ginkgo.It("Should create multiple placementdecisions once scheduled", func() {
 			assertBindingClusterSet(clusterSet1Name, namespace)
 			assertCreatingClusters(clusterSet1Name, 101)

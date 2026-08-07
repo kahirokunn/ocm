@@ -69,6 +69,7 @@ type schedulingController struct {
 	scheduler               Scheduler
 	eventsRecorder          kevents.EventRecorder
 	metricsRecorder         *metrics.ScheduleMetrics
+	enqueuer                *enqueuer
 }
 
 // NewSchedulingController return an instance of schedulingController
@@ -100,14 +101,12 @@ func NewSchedulingController(
 		scheduler:               scheduler,
 		eventsRecorder:          krecorder,
 		metricsRecorder:         metricsRecorder,
+		enqueuer:                enQueuer,
 	}
 
 	// setup event handler for cluster informer.
-	// Once a cluster changes, clusterEventHandler enqueues all placements which are
-	// impacted potentially for further reconciliation. It might not function before the
-	// informers/listers of clusterset/clustersetbinding/placement are synced during
-	// controller booting. But that should not cause any problem because all existing
-	// placements will be enqueued by the controller anyway when booting.
+	// Once a cluster changes, clusterEventHandler enqueues the cluster sets that may be
+	// impacted. The worker expands them after all informer caches are synchronized.
 	_, err := clusterInformer.Informer().AddEventHandler(&clusterEventHandler{
 		enqueuer: enQueuer,
 	})
@@ -116,11 +115,8 @@ func NewSchedulingController(
 	}
 
 	// setup event handler for clusterset informer
-	// Once a clusterset changes, clusterSetEventHandler enqueues all placements which are
-	// impacted potentially for further reconciliation. It might not function before the
-	// informers/listers of clustersetbinding/placement are synced during controller
-	// booting. But that should not cause any problem because all existing placements will
-	// be enqueued by the controller anyway when booting.
+	// Once a clusterset changes, enqueue its key. The worker resolves bindings from the
+	// synchronized informer cache.
 	_, err = clusterSetInformer.Informer().AddEventHandler(&cache.ResourceEventHandlerFuncs{
 		AddFunc: enQueuer.enqueueClusterSet,
 		UpdateFunc: func(oldObj, newObj interface{}) {
@@ -133,11 +129,8 @@ func NewSchedulingController(
 	}
 
 	// setup event handler for clustersetbinding informer
-	// Once a clustersetbinding changes, clusterSetBindingEventHandler enqueues all placements
-	// which are impacted potentially for further reconciliation. It might not function before
-	// the informers/listers of clusterset/placement are synced during controller booting. But
-	// that should not cause any problem because all existing placements will be enqueued by
-	// the controller anyway when booting.
+	// Once a clustersetbinding changes, enqueue its key. The worker resolves placements
+	// from the synchronized informer cache.
 	_, err = clusterSetBindingInformer.Informer().AddEventHandler(&cache.ResourceEventHandlerFuncs{
 		AddFunc: enQueuer.enqueueClusterSetBinding,
 		UpdateFunc: func(oldObj, newObj interface{}) {
@@ -164,12 +157,15 @@ func NewSchedulingController(
 	return factory.New().
 		WithSyncContext(syncCtx).
 		WithInformersQueueKeysFunc(
-			queue.QueueKeyByMetaNamespaceName,
+			func(obj runtime.Object) []string {
+				accessor, _ := meta.Accessor(obj)
+				return []string{newPlacementQueueKey(accessor.GetNamespace(), accessor.GetName())}
+			},
 			placementInformer.Informer()).
 		WithFilteredEventsInformersQueueKeysFunc(func(obj runtime.Object) []string {
 			accessor, _ := meta.Accessor(obj)
 			placementName := accessor.GetLabels()[clusterapiv1beta1.PlacementLabel]
-			return []string{fmt.Sprintf("%s/%s", accessor.GetNamespace(), placementName)}
+			return []string{newPlacementQueueKey(accessor.GetNamespace(), placementName)}
 		},
 			queue.FileterByLabel(clusterapiv1beta1.PlacementLabel),
 			placementDecisionInformer.Informer()).
@@ -180,10 +176,31 @@ func NewSchedulingController(
 
 func (c *schedulingController) sync(ctx context.Context, syncCtx factory.SyncContext, queueKey string) error {
 	logger := klog.FromContext(ctx).WithValues("queueKey", queueKey)
-	logger.V(4).Info("Reconciling placement")
+	logger.V(4).Info("Reconciling scheduling queue key")
 	ctx = klog.NewContext(ctx, logger)
 
-	placement, err := c.getPlacement(queueKey)
+	key, err := parseSchedulingQueueKey(queueKey)
+	if err != nil {
+		utilruntime.HandleError(err)
+		return nil
+	}
+
+	switch key.keyType {
+	case clusterSetQueueKeyType:
+		return c.enqueuer.enqueueClusterSetBindings(key.name)
+	case clusterSetBindingQueueKeyType:
+		return c.enqueuer.enqueuePlacementsByClusterSetBinding(key.namespace, key.name)
+	case placementScoreQueueKeyType:
+		return c.enqueuer.enqueuePlacementsByScore(key.namespace, key.name)
+	case placementQueueKeyType:
+		return c.syncPlacementQueueKey(ctx, syncCtx, queueKey, key.namespace, key.name)
+	default:
+		return nil
+	}
+}
+
+func (c *schedulingController) syncPlacementQueueKey(ctx context.Context, syncCtx factory.SyncContext, queueKey, namespace, name string) error {
+	placement, err := c.placementLister.Placements(namespace).Get(name)
 	if errors.IsNotFound(err) {
 		// no work if placement is deleted
 		return nil
@@ -193,22 +210,6 @@ func (c *schedulingController) sync(ctx context.Context, syncCtx factory.SyncCon
 	}
 
 	return c.syncPlacement(ctx, syncCtx, queueKey, placement)
-}
-
-func (c *schedulingController) getPlacement(queueKey string) (*clusterapiv1beta1.Placement, error) {
-	namespace, name, err := cache.SplitMetaNamespaceKey(queueKey)
-	if err != nil {
-		// ignore placement whose key is not in format: namespace/name
-		utilruntime.HandleError(err)
-		return nil, nil
-	}
-
-	placement, err := c.placementLister.Placements(namespace).Get(name)
-	if err != nil {
-		return nil, err
-	}
-
-	return placement, nil
 }
 
 func (c *schedulingController) syncPlacement(ctx context.Context, syncCtx factory.SyncContext, queueKey string, placement *clusterapiv1beta1.Placement) error {
@@ -259,10 +260,9 @@ func (c *schedulingController) syncPlacement(ctx context.Context, syncCtx factor
 
 	// requeue placement if requeueAfter is defined in scheduleResult
 	if syncCtx != nil && scheduleResult.RequeueAfter() != nil {
-		key, _ := cache.MetaNamespaceKeyFunc(placement)
 		t := scheduleResult.RequeueAfter()
-		logger.V(4).Info("Requeue placement after time", "placementKey", key, "time", t)
-		syncCtx.Queue().AddAfter(key, *t)
+		logger.V(4).Info("Requeue placement after time", "placementKey", queueKey, "time", t)
+		syncCtx.Queue().AddAfter(queueKey, *t)
 	}
 
 	// create/update placement decisions

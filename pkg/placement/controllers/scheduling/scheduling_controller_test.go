@@ -570,7 +570,7 @@ func TestSchedulingController_sync(t *testing.T) {
 				metricsRecorder:         metrics.NewScheduleMetrics(clock.RealClock{}),
 			}
 
-			key := c.placement.Namespace + "/" + c.placement.Name
+			key := newPlacementQueueKey(c.placement.Namespace, c.placement.Name)
 			sysCtx := testingcommon.NewFakeSyncContext(t, key)
 			syncErr := ctrl.sync(context.TODO(), sysCtx, key)
 			if syncErr != nil {
