@@ -31,9 +31,8 @@ const (
 )
 
 type enqueuer struct {
-	logger               klog.Logger
-	queue                workqueue.TypedRateLimitingInterface[string]
-	enqueuePlacementFunc func(obj interface{}, queue workqueue.TypedRateLimitingInterface[string])
+	logger klog.Logger
+	queue  workqueue.TypedRateLimitingInterface[string]
 
 	clusterLister            clusterlisterv1.ManagedClusterLister
 	clusterSetLister         clusterlisterv1beta2.ManagedClusterSetLister
@@ -66,7 +65,6 @@ func newEnqueuer(
 	return &enqueuer{
 		logger:                   klog.FromContext(ctx),
 		queue:                    queue,
-		enqueuePlacementFunc:     enqueuePlacement,
 		clusterLister:            clusterInformer.Lister(),
 		clusterSetLister:         clusterSetInformer.Lister(),
 		placementIndexer:         placementInformer.Informer().GetIndexer(),
@@ -74,13 +72,20 @@ func newEnqueuer(
 	}
 }
 
-func enqueuePlacement(obj interface{}, queue workqueue.TypedRateLimitingInterface[string]) {
+func (e *enqueuer) enqueuePlacement(obj interface{}) {
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err != nil {
 		runtime.HandleError(err)
 		return
 	}
-	queue.Add(key)
+
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		runtime.HandleError(err)
+		return
+	}
+
+	e.queue.Add(newPlacementQueueKey(namespace, name))
 }
 
 func (e *enqueuer) enqueueClusterSetBinding(obj interface{}) {
@@ -90,23 +95,31 @@ func (e *enqueuer) enqueueClusterSetBinding(obj interface{}) {
 		return
 	}
 
-	namespace, _, err := cache.SplitMetaNamespaceKey(key)
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		runtime.HandleError(err)
 		return
 	}
+	if namespace == "" || name == "" {
+		runtime.HandleError(fmt.Errorf("invalid cluster set binding key %q", key))
+		return
+	}
+
+	e.queue.Add(newClusterSetBindingQueueKey(namespace, name))
+}
+
+func (e *enqueuer) enqueuePlacementsByClusterSetBinding(namespace, name string) error {
+	key := fmt.Sprintf("%s/%s", namespace, name)
 
 	// enqueue all placement that ref to the binding
 	objs, err := e.placementIndexer.ByIndex(placementsByClusterSetBinding, key)
 	if err != nil {
-		runtime.HandleError(err)
-		return
+		return err
 	}
 
 	anyObjs, err := e.placementIndexer.ByIndex(placementsByClusterSetBinding, fmt.Sprintf("%s/%s", namespace, anyClusterSet))
 	if err != nil {
-		runtime.HandleError(err)
-		return
+		return err
 	}
 
 	objs = append(objs, anyObjs...)
@@ -114,8 +127,10 @@ func (e *enqueuer) enqueueClusterSetBinding(obj interface{}) {
 	for _, o := range objs {
 		placement := o.(*clusterapiv1beta1.Placement)
 		e.logger.V(4).Info("Enqueue placement because of binding", "placementNamespace", placement.Namespace, "placementName", placement.Name, "bindingKey", key)
-		e.enqueuePlacementFunc(placement, e.queue)
+		e.enqueuePlacement(placement)
 	}
+
+	return nil
 }
 
 func (e *enqueuer) enqueueClusterSet(obj interface{}) {
@@ -125,17 +140,32 @@ func (e *enqueuer) enqueueClusterSet(obj interface{}) {
 		return
 	}
 
-	objs, err := e.clusterSetBindingIndexer.ByIndex(clustersetBindingsByClusterSet, key)
+	_, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		runtime.HandleError(err)
 		return
 	}
+	if name == "" {
+		runtime.HandleError(fmt.Errorf("invalid cluster set key %q", key))
+		return
+	}
+
+	e.queue.Add(newClusterSetQueueKey(name))
+}
+
+func (e *enqueuer) enqueueClusterSetBindings(clusterSetName string) error {
+	objs, err := e.clusterSetBindingIndexer.ByIndex(clustersetBindingsByClusterSet, clusterSetName)
+	if err != nil {
+		return err
+	}
 
 	for _, o := range objs {
 		clusterSetBinding := o.(*clusterapiv1beta2.ManagedClusterSetBinding)
-		e.logger.V(4).Info("Enqueue clustersetbinding because of clusterset", "clusterSetBinding", klog.KObj(clusterSetBinding), "clustersetKey", key)
+		e.logger.V(4).Info("Enqueue clustersetbinding because of clusterset", "clusterSetBinding", klog.KObj(clusterSetBinding), "clusterSetName", clusterSetName)
 		e.enqueueClusterSetBinding(clusterSetBinding)
 	}
+
+	return nil
 }
 
 func (e *enqueuer) enqueueCluster(obj interface{}) {
@@ -169,33 +199,40 @@ func (e *enqueuer) enqueuePlacementScore(obj interface{}) {
 		runtime.HandleError(err)
 		return
 	}
-
-	objs, err := e.placementIndexer.ByIndex(placementsByScore, name)
-	if err != nil {
-		runtime.HandleError(err)
+	if namespace == "" || name == "" {
+		runtime.HandleError(fmt.Errorf("invalid placement score key %q", key))
 		return
+	}
+
+	e.queue.Add(newPlacementScoreQueueKey(namespace, name))
+}
+
+func (e *enqueuer) enqueuePlacementsByScore(clusterName, scoreName string) error {
+	objs, err := e.placementIndexer.ByIndex(placementsByScore, scoreName)
+	if err != nil {
+		return err
 	}
 
 	// filter the namespace of placement based on cluster. Find all related clustersetbinding
 	// to the cluster at first. Only enqueue placement when its namespace is in the valid namespaces
 	// of clustersetbindings.
 	filteredBindingNamespaces := sets.NewString()
-	cluster, err := e.clusterLister.Get(namespace)
+	cluster, err := e.clusterLister.Get(clusterName)
 	if err != nil {
-		e.logger.V(4).Error(err, "Unable to get cluster", "clusterNamespace", namespace)
+		e.logger.V(4).Error(err, "Unable to get cluster", "clusterName", clusterName)
+		return nil
 	}
 
 	clusterSets, err := clustersdkv1beta2.GetClusterSetsOfCluster(cluster, e.clusterSetLister)
 	if err != nil {
 		e.logger.V(4).Error(err, "Unable to get clusterSets of cluster", "clusterName", cluster.GetName())
-		return
+		return err
 	}
 
 	for _, clusterset := range clusterSets {
 		bindingObjs, err := e.clusterSetBindingIndexer.ByIndex(clustersetBindingsByClusterSet, clusterset.Name)
 		if err != nil {
-			e.logger.V(4).Error(err, "Unable to get clusterSetBindings of clusterset", "clustersetName", clusterset.Name)
-			continue
+			return err
 		}
 
 		for _, bindingObj := range bindingObjs {
@@ -207,10 +244,12 @@ func (e *enqueuer) enqueuePlacementScore(obj interface{}) {
 	for _, o := range objs {
 		placement := o.(*clusterapiv1beta1.Placement)
 		if filteredBindingNamespaces.Has(placement.Namespace) {
-			e.logger.V(4).Info("Enqueue placement because of score", "placementNamespace", placement.Namespace, "placementName", placement.Name, "scoreKey", key)
-			e.enqueuePlacementFunc(placement, e.queue)
+			e.logger.V(4).Info("Enqueue placement because of score", "placementNamespace", placement.Namespace, "placementName", placement.Name, "clusterName", clusterName, "scoreName", scoreName)
+			e.enqueuePlacement(placement)
 		}
 	}
+
+	return nil
 }
 
 func indexPlacementByClusterSetBinding(obj interface{}) ([]string, error) {

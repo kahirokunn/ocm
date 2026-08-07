@@ -9,7 +9,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2/ktesting"
 
 	clusterclient "open-cluster-management.io/api/client/cluster/clientset/versioned"
@@ -71,6 +70,41 @@ func newClusterInformerFactory(t *testing.T, clusterClient clusterclient.Interfa
 	}
 
 	return clusterInformerFactory
+}
+
+func drainPlacementQueue(t *testing.T, q *enqueuer) sets.String {
+	t.Helper()
+
+	queuedPlacements := sets.NewString()
+	for q.queue.Len() > 0 {
+		key, shutdown := q.queue.Get()
+		if shutdown {
+			t.Fatal("work queue unexpectedly shut down")
+		}
+
+		parsedKey, err := parseSchedulingQueueKey(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		switch parsedKey.keyType {
+		case clusterSetQueueKeyType:
+			err = q.enqueueClusterSetBindings(parsedKey.name)
+		case clusterSetBindingQueueKeyType:
+			err = q.enqueuePlacementsByClusterSetBinding(parsedKey.namespace, parsedKey.name)
+		case placementScoreQueueKeyType:
+			err = q.enqueuePlacementsByScore(parsedKey.namespace, parsedKey.name)
+		case placementQueueKeyType:
+			queuedPlacements.Insert(parsedKey.namespace + "/" + parsedKey.name)
+		}
+		q.queue.Forget(key)
+		q.queue.Done(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	return queuedPlacements
 }
 
 func TestEnqueuePlacementsByClusterSet(t *testing.T) {
@@ -198,13 +232,8 @@ func TestEnqueuePlacementsByClusterSet(t *testing.T) {
 				clusterInformerFactory.Cluster().V1beta1().Placements(),
 				clusterInformerFactory.Cluster().V1beta2().ManagedClusterSetBindings(),
 			)
-			queuedKeys := sets.NewString()
-			fakeEnqueuePlacement := func(obj interface{}, queue workqueue.TypedRateLimitingInterface[string]) {
-				key, _ := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-				queuedKeys.Insert(key)
-			}
-			q.enqueuePlacementFunc = fakeEnqueuePlacement
 			q.enqueueClusterSet(c.clusterSet)
+			queuedKeys := drainPlacementQueue(t, q)
 
 			expectedQueuedKeys := sets.NewString(c.queuedKeys...)
 			if !queuedKeys.Equal(expectedQueuedKeys) {
@@ -307,13 +336,8 @@ func TestEnqueuePlacementsByClusterSetBinding(t *testing.T) {
 				clusterInformerFactory.Cluster().V1beta1().Placements(),
 				clusterInformerFactory.Cluster().V1beta2().ManagedClusterSetBindings(),
 			)
-			queuedKeys := sets.NewString()
-			fakeEnqueuePlacement := func(obj interface{}, queue workqueue.TypedRateLimitingInterface[string]) {
-				key, _ := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-				queuedKeys.Insert(key)
-			}
-			q.enqueuePlacementFunc = fakeEnqueuePlacement
 			q.enqueueClusterSetBinding(c.clusterSetBinding)
+			queuedKeys := drainPlacementQueue(t, q)
 
 			expectedQueuedKeys := sets.NewString(c.queuedKeys...)
 			if !queuedKeys.Equal(expectedQueuedKeys) {
@@ -397,18 +421,115 @@ func TestEnqueuePlacementsByScore(t *testing.T) {
 				clusterInformerFactory.Cluster().V1beta1().Placements(),
 				clusterInformerFactory.Cluster().V1beta2().ManagedClusterSetBindings(),
 			)
-			queuedKeys := sets.NewString()
-			fakeEnqueuePlacement := func(obj interface{}, queue workqueue.TypedRateLimitingInterface[string]) {
-				key, _ := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-				queuedKeys.Insert(key)
-			}
-			q.enqueuePlacementFunc = fakeEnqueuePlacement
 			q.enqueuePlacementScore(c.score)
+			queuedKeys := drainPlacementQueue(t, q)
 
 			expectedQueuedKeys := sets.NewString(c.queuedKeys...)
 			if !queuedKeys.Equal(expectedQueuedKeys) {
 				t.Errorf("expected queued placements %q, but got %s", strings.Join(expectedQueuedKeys.List(), ","), strings.Join(queuedKeys.List(), ","))
 			}
 		})
+	}
+}
+
+func TestDependencyEventsAreResolvedFromCurrentCaches(t *testing.T) {
+	tests := []struct {
+		name         string
+		enqueueEvent func(*enqueuer)
+	}{
+		{
+			name: "cluster set event before binding and placement caches",
+			enqueueEvent: func(q *enqueuer) {
+				q.enqueueClusterSet(testinghelpers.NewClusterSet("clusterset1").Build())
+			},
+		},
+		{
+			name: "binding event before placement cache",
+			enqueueEvent: func(q *enqueuer) {
+				q.enqueueClusterSetBinding(testinghelpers.NewClusterSetBinding("ns1", "clusterset1"))
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			clusterClient := clusterfake.NewSimpleClientset()
+			clusterInformerFactory := newClusterInformerFactory(t, clusterClient)
+			syncCtx := testingcommon.NewFakeSyncContext(t, "fake")
+			q := newEnqueuer(
+				ctx,
+				syncCtx.Queue(),
+				clusterInformerFactory.Cluster().V1().ManagedClusters(),
+				clusterInformerFactory.Cluster().V1beta2().ManagedClusterSets(),
+				clusterInformerFactory.Cluster().V1beta1().Placements(),
+				clusterInformerFactory.Cluster().V1beta2().ManagedClusterSetBindings(),
+			)
+
+			// Simulate an informer callback running before the related informer caches
+			// contain the downstream objects. The queued dependency must be resolved
+			// later from the current cache contents.
+			test.enqueueEvent(q)
+			if err := clusterInformerFactory.Cluster().V1beta2().ManagedClusterSetBindings().Informer().GetStore().Add(
+				testinghelpers.NewClusterSetBinding("ns1", "clusterset1")); err != nil {
+				t.Fatal(err)
+			}
+			if err := clusterInformerFactory.Cluster().V1beta1().Placements().Informer().GetStore().Add(
+				testinghelpers.NewPlacement("ns1", "placement1").Build()); err != nil {
+				t.Fatal(err)
+			}
+
+			actual := drainPlacementQueue(t, q)
+			expected := sets.NewString("ns1/placement1")
+			if !actual.Equal(expected) {
+				t.Errorf("expected queued placements %v, got %v", expected.List(), actual.List())
+			}
+		})
+	}
+}
+
+func TestSchedulingControllerDispatchesDependencyQueueKeys(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
+	objects := []runtime.Object{
+		testinghelpers.NewClusterSetBinding("ns1", "clusterset1"),
+		testinghelpers.NewPlacement("ns1", "placement1").Build(),
+	}
+	clusterClient := clusterfake.NewSimpleClientset(objects...)
+	clusterInformerFactory := newClusterInformerFactory(t, clusterClient, objects...)
+	syncCtx := testingcommon.NewFakeSyncContext(t, "fake")
+	q := newEnqueuer(
+		ctx,
+		syncCtx.Queue(),
+		clusterInformerFactory.Cluster().V1().ManagedClusters(),
+		clusterInformerFactory.Cluster().V1beta2().ManagedClusterSets(),
+		clusterInformerFactory.Cluster().V1beta1().Placements(),
+		clusterInformerFactory.Cluster().V1beta2().ManagedClusterSetBindings(),
+	)
+	controller := &schedulingController{enqueuer: q}
+
+	if err := controller.sync(ctx, syncCtx, newClusterSetQueueKey("clusterset1")); err != nil {
+		t.Fatal(err)
+	}
+	bindingKey, shutdown := q.queue.Get()
+	if shutdown {
+		t.Fatal("work queue unexpectedly shut down")
+	}
+	q.queue.Forget(bindingKey)
+	q.queue.Done(bindingKey)
+	if bindingKey != newClusterSetBindingQueueKey("ns1", "clusterset1") {
+		t.Fatalf("expected cluster set binding key, got %q", bindingKey)
+	}
+
+	if err := controller.sync(ctx, syncCtx, bindingKey); err != nil {
+		t.Fatal(err)
+	}
+	placementKey, shutdown := q.queue.Get()
+	if shutdown {
+		t.Fatal("work queue unexpectedly shut down")
+	}
+	q.queue.Forget(placementKey)
+	q.queue.Done(placementKey)
+	if placementKey != newPlacementQueueKey("ns1", "placement1") {
+		t.Fatalf("expected placement key, got %q", placementKey)
 	}
 }
