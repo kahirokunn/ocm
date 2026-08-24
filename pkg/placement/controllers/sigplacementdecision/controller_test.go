@@ -74,9 +74,9 @@ func TestSIGPlacementDecisionControllerSync(t *testing.T) {
 	}{
 		{
 			name: "create SIG PD from OCM PD with decisions",
-			key:  "ns1/pd-1",
+			key:  "ns1/my-placement-decision-1",
 			ocmPDs: []runtime.Object{
-				newOCMPlacementDecision("ns1", "pd-1", "my-placement", "0", []v1beta1.ClusterDecision{
+				newOCMPlacementDecision("ns1", "my-placement-decision-1", "my-placement", "0", []v1beta1.ClusterDecision{
 					{ClusterName: "cluster1", Reason: "score"},
 					{ClusterName: "cluster2", Reason: "affinity"},
 				}),
@@ -85,8 +85,8 @@ func TestSIGPlacementDecisionControllerSync(t *testing.T) {
 			expectedCreates: 1,
 			validateActions: func(t *testing.T, actions []clienttesting.Action) {
 				created := actions[0].(clienttesting.CreateAction).GetObject().(*cpv1alpha1.PlacementDecision)
-				if created.Name != "pd-1" {
-					t.Errorf("expected name pd-1, got %s", created.Name)
+				if created.Name != "my-placement-decision-1" {
+					t.Errorf("expected name my-placement-decision-1, got %s", created.Name)
 				}
 				if created.Namespace != "ns1" {
 					t.Errorf("expected namespace ns1, got %s", created.Namespace)
@@ -118,12 +118,15 @@ func TestSIGPlacementDecisionControllerSync(t *testing.T) {
 				if created.Labels[cpv1alpha1.DecisionIndexLabel] != "0" {
 					t.Errorf("expected decision-index label '0', got %s", created.Labels[cpv1alpha1.DecisionIndexLabel])
 				}
+				if created.Labels[decisionGroupIndexLabel] != "0" {
+					t.Errorf("expected decision-group-index label '0', got %s", created.Labels[decisionGroupIndexLabel])
+				}
 				if len(created.OwnerReferences) != 1 {
 					t.Fatalf("expected 1 owner reference, got %d", len(created.OwnerReferences))
 				}
 				ownerRef := created.OwnerReferences[0]
-				if ownerRef.Name != "pd-1" || ownerRef.Kind != "PlacementDecision" {
-					t.Errorf("expected owner reference to point to OCM PlacementDecision pd-1, got %+v", ownerRef)
+				if ownerRef.Name != "my-placement-decision-1" || ownerRef.Kind != "PlacementDecision" {
+					t.Errorf("expected owner reference to point to OCM PlacementDecision my-placement-decision-1, got %+v", ownerRef)
 				}
 				if ownerRef.Controller == nil || !*ownerRef.Controller {
 					t.Errorf("expected owner reference to be a controller reference")
@@ -208,7 +211,7 @@ func TestSIGPlacementDecisionControllerSync(t *testing.T) {
 					cpv1alpha1.LabelClusterManagerKey: SchedulerName,
 					cpv1alpha1.PlacementKeyLabel:      "my-placement",
 					cpv1alpha1.DecisionKeyLabel:       "my-placement",
-					cpv1alpha1.DecisionIndexLabel:     "0",
+					decisionGroupIndexLabel:           "0",
 				}, []metav1.OwnerReference{ownerRefFor(newOCMPlacementDecision("ns1", "pd-noop", "my-placement", "0", nil))},
 					[]cpv1alpha1.ClusterDecision{
 						{ClusterProfileRef: cpv1alpha1.ClusterProfileReference{Name: "cluster1", Namespace: "ns1"}, Reason: "score"},
@@ -351,15 +354,16 @@ func TestSIGPlacementDecisionControllerSync(t *testing.T) {
 }
 
 func TestBuildSIGPlacementDecision(t *testing.T) {
-	ocmPD := newOCMPlacementDecision("ns1", "pd-1", "my-placement", "2", []v1beta1.ClusterDecision{
+	ocmPD := newOCMPlacementDecision("ns1", "my-placement-decision-3", "my-placement", "2", []v1beta1.ClusterDecision{
 		{ClusterName: "cluster-a", Reason: "top-score"},
 		{ClusterName: "cluster-b", Reason: ""},
 	})
+	ocmPD.Labels[v1beta1.DecisionGroupNameLabel] = "production"
 
 	result := buildSIGPlacementDecision(ocmPD)
 
-	if result.Name != "pd-1" {
-		t.Errorf("expected name pd-1, got %s", result.Name)
+	if result.Name != "my-placement-decision-3" {
+		t.Errorf("expected name my-placement-decision-3, got %s", result.Name)
 	}
 	if result.Namespace != "ns1" {
 		t.Errorf("expected namespace ns1, got %s", result.Namespace)
@@ -378,6 +382,12 @@ func TestBuildSIGPlacementDecision(t *testing.T) {
 	}
 	if result.Labels[cpv1alpha1.DecisionIndexLabel] != "2" {
 		t.Errorf("expected decision-index label '2', got %s", result.Labels[cpv1alpha1.DecisionIndexLabel])
+	}
+	if result.Labels[decisionGroupIndexLabel] != "2" {
+		t.Errorf("expected decision-group-index label '2', got %s", result.Labels[decisionGroupIndexLabel])
+	}
+	if result.Labels[decisionGroupNameLabel] != "production" {
+		t.Errorf("expected decision-group-name label 'production', got %s", result.Labels[decisionGroupNameLabel])
 	}
 	if len(result.Decisions) != 2 {
 		t.Fatalf("expected 2 decisions, got %d", len(result.Decisions))
@@ -412,5 +422,103 @@ func TestBuildSIGPlacementDecision(t *testing.T) {
 	}
 	if ownerRef.BlockOwnerDeletion == nil || !*ownerRef.BlockOwnerDeletion {
 		t.Errorf("expected owner reference to block owner deletion")
+	}
+}
+
+func TestBuildSIGPlacementDecisionLabels(t *testing.T) {
+	tests := []struct {
+		name                  string
+		placementDecisionName string
+		placementName         string
+		groupIndex            string
+		groupName             string
+		expectedDecisionIndex string
+		expectedGroupIndex    string
+		expectedGroupName     string
+	}{
+		{
+			name:                  "first slice of the first group",
+			placementDecisionName: "rollout-decision-1",
+			placementName:         "rollout",
+			groupIndex:            "0",
+			groupName:             "canary",
+			expectedDecisionIndex: "0",
+			expectedGroupIndex:    "0",
+			expectedGroupName:     "canary",
+		},
+		{
+			name:                  "second slice shares the first group index",
+			placementDecisionName: "rollout-decision-2",
+			placementName:         "rollout",
+			groupIndex:            "0",
+			groupName:             "canary",
+			expectedDecisionIndex: "1",
+			expectedGroupIndex:    "0",
+			expectedGroupName:     "canary",
+		},
+		{
+			name:                  "third slice starts the next group",
+			placementDecisionName: "rollout-decision-3",
+			placementName:         "rollout",
+			groupIndex:            "1",
+			groupName:             "production",
+			expectedDecisionIndex: "2",
+			expectedGroupIndex:    "1",
+			expectedGroupName:     "production",
+		},
+		{
+			name:                  "manual name omits only the slice index",
+			placementDecisionName: "manual-decision",
+			placementName:         "rollout",
+			groupIndex:            "2",
+			groupName:             "manual",
+			expectedGroupIndex:    "2",
+			expectedGroupName:     "manual",
+		},
+		{
+			name:                  "invalid group index omits group labels",
+			placementDecisionName: "rollout-decision-4",
+			placementName:         "rollout",
+			groupIndex:            "-1",
+			groupName:             "invalid",
+			expectedDecisionIndex: "3",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ocmPD := newOCMPlacementDecision("rollout-ns", test.placementDecisionName,
+				test.placementName, test.groupIndex, nil)
+			ocmPD.Labels[v1beta1.DecisionGroupNameLabel] = test.groupName
+
+			result := buildSIGPlacementDecision(ocmPD)
+
+			if result.Labels[cpv1alpha1.DecisionIndexLabel] != test.expectedDecisionIndex {
+				t.Errorf("expected decision-index %q, got %q",
+					test.expectedDecisionIndex, result.Labels[cpv1alpha1.DecisionIndexLabel])
+			}
+			if result.Labels[decisionGroupIndexLabel] != test.expectedGroupIndex {
+				t.Errorf("expected decision-group-index %q, got %q",
+					test.expectedGroupIndex, result.Labels[decisionGroupIndexLabel])
+			}
+			if result.Labels[decisionGroupNameLabel] != test.expectedGroupName {
+				t.Errorf("expected decision-group-name %q, got %q",
+					test.expectedGroupName, result.Labels[decisionGroupNameLabel])
+			}
+		})
+	}
+}
+
+func TestBuildSIGPlacementDecisionUsesSourceNamespaceForClusterProfile(t *testing.T) {
+	for _, namespace := range []string{"development", "production"} {
+		ocmPD := newOCMPlacementDecision(namespace, "rollout-decision-1", "rollout", "0",
+			[]v1beta1.ClusterDecision{{ClusterName: "shared-cluster"}})
+
+		result := buildSIGPlacementDecision(ocmPD)
+
+		if result.Decisions[0].ClusterProfileRef.Namespace != namespace {
+			t.Errorf("expected ClusterProfile shared-cluster in namespace %q, got %q",
+				namespace, result.Decisions[0].ClusterProfileRef.Namespace)
+		}
 	}
 }

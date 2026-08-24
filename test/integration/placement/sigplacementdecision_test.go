@@ -136,6 +136,19 @@ var _ = ginkgo.Describe("SIGPlacementDecision", func() {
 				}
 				_, err = clusterClient.ClusterV1().ManagedClusters().UpdateStatus(context.Background(), cluster, metav1.UpdateOptions{})
 				gomega.Expect(err).ToNot(gomega.HaveOccurred())
+
+				clusterProfile := &cpv1alpha1.ClusterProfile{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      name,
+						Namespace: namespace,
+					},
+					Spec: cpv1alpha1.ClusterProfileSpec{
+						ClusterManager: cpv1alpha1.ClusterManager{Name: sigplacementdecision.SchedulerName},
+					},
+				}
+				_, err = cpClient.ApisV1alpha1().ClusterProfiles(namespace).Create(
+					context.Background(), clusterProfile, metav1.CreateOptions{})
+				gomega.Expect(err).ToNot(gomega.HaveOccurred())
 			}
 
 			ginkgo.By("Create Placement")
@@ -190,6 +203,10 @@ var _ = ginkgo.Describe("SIGPlacementDecision", func() {
 			sigPD := sigPDList.Items[0]
 			for _, d := range sigPD.Decisions {
 				gomega.Expect(d.ClusterProfileRef.Name).ToNot(gomega.BeEmpty())
+				gomega.Expect(d.ClusterProfileRef.Namespace).To(gomega.Equal(namespace))
+				_, err := cpClient.ApisV1alpha1().ClusterProfiles(d.ClusterProfileRef.Namespace).Get(
+					context.Background(), d.ClusterProfileRef.Name, metav1.GetOptions{})
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
 			}
 
 			ginkgo.By("Verify SIG MC PlacementDecision has an OwnerReference to the OCM PlacementDecision")

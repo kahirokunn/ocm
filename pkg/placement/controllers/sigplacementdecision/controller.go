@@ -3,6 +3,8 @@ package sigplacementdecision
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -23,7 +25,10 @@ import (
 )
 
 const (
-	SchedulerName = "open-cluster-management"
+	SchedulerName                  = "open-cluster-management"
+	decisionGroupIndexLabel        = "multicluster.x-k8s.io/decision-group-index"
+	decisionGroupNameLabel         = "multicluster.x-k8s.io/decision-group-name"
+	placementDecisionNameDelimiter = "-decision-"
 )
 
 // sigPlacementDecisionController syncs OCM PlacementDecision to SIG MC PlacementDecision.
@@ -133,13 +138,20 @@ func buildSIGPlacementDecision(ocmPD *v1beta1.PlacementDecision) *cpv1alpha1.Pla
 		cpv1alpha1.LabelClusterManagerKey: SchedulerName,
 	}
 
-	if placementName, ok := ocmPD.Labels[v1beta1.PlacementLabel]; ok {
+	if placementName, ok := ocmPD.Labels[v1beta1.PlacementLabel]; ok && placementName != "" {
 		labels[cpv1alpha1.PlacementKeyLabel] = placementName
 		labels[cpv1alpha1.DecisionKeyLabel] = placementName
-	}
 
-	if groupIndex, ok := ocmPD.Labels[v1beta1.DecisionGroupIndexLabel]; ok {
-		labels[cpv1alpha1.DecisionIndexLabel] = groupIndex
+		if decisionIndex, ok := placementDecisionIndex(placementName, ocmPD.Name); ok {
+			labels[cpv1alpha1.DecisionIndexLabel] = decisionIndex
+		}
+
+		if groupIndex, ok := nonNegativeIndex(ocmPD.Labels[v1beta1.DecisionGroupIndexLabel]); ok {
+			labels[decisionGroupIndexLabel] = groupIndex
+			if groupName := ocmPD.Labels[v1beta1.DecisionGroupNameLabel]; groupName != "" {
+				labels[decisionGroupNameLabel] = groupName
+			}
+		}
 	}
 
 	decisions := make([]cpv1alpha1.ClusterDecision, 0, len(ocmPD.Status.Decisions))
@@ -165,4 +177,29 @@ func buildSIGPlacementDecision(ocmPD *v1beta1.PlacementDecision) *cpv1alpha1.Pla
 		Decisions:     decisions,
 		SchedulerName: SchedulerName,
 	}
+}
+
+func placementDecisionIndex(placementName, placementDecisionName string) (string, bool) {
+	prefix := placementName + placementDecisionNameDelimiter
+	indexString := strings.TrimPrefix(placementDecisionName, prefix)
+	if indexString == placementDecisionName {
+		return "", false
+	}
+
+	// OCM PlacementDecision names use a one-based suffix. The standard decision-index
+	// is zero-based and remains unique even when one decision group spans multiple slices.
+	index, err := strconv.Atoi(indexString)
+	if err != nil || index < 1 || strconv.Itoa(index) != indexString {
+		return "", false
+	}
+
+	return strconv.Itoa(index - 1), true
+}
+
+func nonNegativeIndex(indexString string) (string, bool) {
+	index, err := strconv.Atoi(indexString)
+	if err != nil || index < 0 || strconv.Itoa(index) != indexString {
+		return "", false
+	}
+	return indexString, true
 }
