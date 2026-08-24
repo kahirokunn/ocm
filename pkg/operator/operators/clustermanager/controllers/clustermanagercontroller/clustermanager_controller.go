@@ -47,6 +47,8 @@ const (
 	defaultHealthProbePort   = int32(8000)
 	defaultMetricsPort       = int32(8080)
 	clusterManagerReSyncTime = 5 * time.Second
+
+	sigPlacementDecisionDependencyMessage = "Placement: SIGPlacementDecision requires the Registration ClusterProfile feature gate to be enabled"
 )
 
 type clusterManagerController struct {
@@ -232,7 +234,16 @@ func (n *clusterManagerController) sync(ctx context.Context, controllerContext f
 	}
 	config.PlacementFeatureGates, placementFeatureMsgs = helpers.ConvertToFeatureGateFlags("Placement", placementFeatureGates, ocmfeature.DefaultHubPlacementFeatureGates)
 	config.PlacementDebugServerEnabled = helpers.FeatureGateEnabled(placementFeatureGates, ocmfeature.DefaultHubPlacementFeatureGates, ocmfeature.PlacementDebugServer)
-	config.SIGPlacementDecisionEnabled = helpers.FeatureGateEnabled(placementFeatureGates, ocmfeature.DefaultHubPlacementFeatureGates, ocmfeature.SIGPlacementDecision)
+	sigPlacementDecisionRequested := helpers.FeatureGateEnabled(placementFeatureGates, ocmfeature.DefaultHubPlacementFeatureGates, ocmfeature.SIGPlacementDecision)
+	config.SIGPlacementDecisionEnabled = sigPlacementDecisionRequested && config.ClusterProfileEnabled
+	if sigPlacementDecisionRequested && !config.ClusterProfileEnabled {
+		config.PlacementFeatureGates = forceDisableFeatureGate(config.PlacementFeatureGates, string(ocmfeature.SIGPlacementDecision))
+		if placementFeatureMsgs == "" {
+			placementFeatureMsgs = sigPlacementDecisionDependencyMessage
+		} else {
+			placementFeatureMsgs += "; " + sigPlacementDecisionDependencyMessage
+		}
+	}
 	if config.PlacementDebugServerEnabled {
 		config.PlacementServingCertSecret = helpers.PlacementDebugServingCertSecret
 	}
@@ -380,6 +391,17 @@ func (n *clusterManagerController) sync(ctx context.Context, controllerContext f
 	}
 
 	return utilerrors.NewAggregate(errs)
+}
+
+func forceDisableFeatureGate(flags []string, featureName string) []string {
+	featurePrefix := fmt.Sprintf("--feature-gates=%s=", featureName)
+	effectiveFlags := make([]string, 0, len(flags)+1)
+	for _, flag := range flags {
+		if !strings.HasPrefix(flag, featurePrefix) {
+			effectiveFlags = append(effectiveFlags, flag)
+		}
+	}
+	return append(effectiveFlags, featurePrefix+"false")
 }
 
 func generateHubClients(hubKubeConfig *rest.Config) (kubernetes.Interface, apiextensionsclient.Interface,

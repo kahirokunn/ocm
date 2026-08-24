@@ -40,7 +40,8 @@ var _ = ginkgo.Describe("SIGPlacementDecision", func() {
 		placementName = fmt.Sprintf("placement-%s", suffix)
 		clusterSet1Name = fmt.Sprintf("clusterset-%s", suffix)
 
-		err := features.HubMutableFeatureGate.Set(fmt.Sprintf("%s=true", ocmfeature.SIGPlacementDecision))
+		err := features.HubMutableFeatureGate.Set(fmt.Sprintf("%s=true,%s=true",
+			ocmfeature.SIGPlacementDecision, ocmfeature.ClusterProfile))
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 		cpClient, err = cpclientset.NewForConfig(restConfig)
@@ -70,7 +71,8 @@ var _ = ginkgo.Describe("SIGPlacementDecision", func() {
 		if cancel != nil {
 			cancel()
 		}
-		err := features.HubMutableFeatureGate.Set(fmt.Sprintf("%s=false", ocmfeature.SIGPlacementDecision))
+		err := features.HubMutableFeatureGate.Set(fmt.Sprintf("%s=false,%s=false",
+			ocmfeature.SIGPlacementDecision, ocmfeature.ClusterProfile))
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 		err = kubeClient.CoreV1().Namespaces().Delete(context.Background(), namespace, metav1.DeleteOptions{})

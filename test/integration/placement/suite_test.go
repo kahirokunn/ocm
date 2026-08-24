@@ -48,6 +48,8 @@ var _ = ginkgo.BeforeSuite(func() {
 
 	err := features.HubMutableFeatureGate.Add(ocmfeature.DefaultHubPlacementFeatureGates)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	err = features.HubMutableFeatureGate.Add(ocmfeature.DefaultHubRegistrationFeatureGates)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 	// start a kube-apiserver
 	testEnv = &envtest.Environment{

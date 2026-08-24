@@ -11,6 +11,7 @@ import (
 	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	fakeapiextensions "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
@@ -1644,6 +1645,145 @@ func TestPlacementFeatureGate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSIGPlacementDecisionRequiresClusterProfile(t *testing.T) {
+	tests := []struct {
+		name                          string
+		clusterProfileEnabled         bool
+		sigPlacementDecisionRequested bool
+		expectSIGResources            bool
+		expectDependencyError         bool
+		expectPlacementFeatureGateArg string
+	}{
+		{
+			name: "both feature gates disabled",
+		},
+		{
+			name:                  "only ClusterProfile enabled",
+			clusterProfileEnabled: true,
+		},
+		{
+			name:                          "SIG PlacementDecision rejected without ClusterProfile",
+			sigPlacementDecisionRequested: true,
+			expectDependencyError:         true,
+			expectPlacementFeatureGateArg: "--feature-gates=SIGPlacementDecision=false",
+		},
+		{
+			name:                          "both feature gates enabled",
+			clusterProfileEnabled:         true,
+			sigPlacementDecisionRequested: true,
+			expectSIGResources:            true,
+			expectPlacementFeatureGateArg: "--feature-gates=SIGPlacementDecision=true",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clusterManager := newClusterManager("testhub")
+			clusterManager.Spec.PlacementImagePullSpec = "testplacement"
+			if test.clusterProfileEnabled {
+				clusterManager.Spec.RegistrationConfiguration = &operatorapiv1.RegistrationHubConfiguration{
+					FeatureGates: []operatorapiv1.FeatureGate{{
+						Feature: string(ocmfeature.ClusterProfile),
+						Mode:    operatorapiv1.FeatureGateModeTypeEnable,
+					}},
+				}
+			}
+			if test.sigPlacementDecisionRequested {
+				clusterManager.Spec.PlacementConfiguration = &operatorapiv1.PlacementConfiguration{
+					FeatureGates: []operatorapiv1.FeatureGate{{
+						Feature: string(ocmfeature.SIGPlacementDecision),
+						Mode:    operatorapiv1.FeatureGateModeTypeEnable,
+					}},
+				}
+			}
+
+			tc := newTestController(t, clusterManager)
+			setup(t, tc, nil)
+
+			syncContext := testingcommon.NewFakeSyncContext(t, clusterManager.Name)
+			if err := tc.clusterManagerController.sync(ctx, syncContext, clusterManager.Name); err != nil {
+				t.Fatalf("expected no sync error, got %v", err)
+			}
+
+			var sigCRDFound bool
+			for _, action := range tc.apiExtensionClient.Actions() {
+				if action.GetVerb() != createVerb {
+					continue
+				}
+				crd, ok := action.(clienttesting.CreateActionImpl).Object.(*apiextensionsv1.CustomResourceDefinition)
+				if ok && crd.Name == "placementdecisions.multicluster.x-k8s.io" {
+					sigCRDFound = true
+				}
+			}
+
+			var placementArgs []string
+			var sigRBACFound bool
+			for _, action := range append(tc.hubKubeClient.Actions(), tc.managementKubeClient.Actions()...) {
+				if action.GetVerb() != createVerb {
+					continue
+				}
+				switch object := action.(clienttesting.CreateActionImpl).Object.(type) {
+				case *appsv1.Deployment:
+					if object.Name == clusterManager.Name+"-placement-controller" {
+						placementArgs = object.Spec.Template.Spec.Containers[0].Args
+					}
+				case *rbacv1.ClusterRole:
+					for _, rule := range object.Rules {
+						if containsString(rule.APIGroups, "multicluster.x-k8s.io") &&
+							containsString(rule.Resources, "placementdecisions") {
+							sigRBACFound = true
+						}
+					}
+				}
+			}
+
+			if sigCRDFound != test.expectSIGResources {
+				t.Errorf("expected SIG PlacementDecision CRD=%v, got %v", test.expectSIGResources, sigCRDFound)
+			}
+			if sigRBACFound != test.expectSIGResources {
+				t.Errorf("expected SIG PlacementDecision RBAC=%v, got %v", test.expectSIGResources, sigRBACFound)
+			}
+			if test.expectPlacementFeatureGateArg != "" && !containsString(placementArgs, test.expectPlacementFeatureGateArg) {
+				t.Errorf("expected placement args to contain %q, got %v", test.expectPlacementFeatureGateArg, placementArgs)
+			}
+			if test.expectPlacementFeatureGateArg == "" && containsArg(placementArgs, "--feature-gates=SIGPlacementDecision=") {
+				t.Errorf("expected no SIGPlacementDecision feature gate argument, got %v", placementArgs)
+			}
+			if test.expectDependencyError && containsString(placementArgs, "--feature-gates=SIGPlacementDecision=true") {
+				t.Errorf("invalid dependency must not enable SIGPlacementDecision, got %v", placementArgs)
+			}
+
+			updated, err := tc.operatorClient.OperatorV1().ClusterManagers().Get(ctx, clusterManager.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("failed to get updated ClusterManager: %v", err)
+			}
+			condition := meta.FindStatusCondition(updated.Status.Conditions, helpers.FeatureGatesTypeValid)
+			if condition == nil {
+				t.Fatal("expected ValidFeatureGates condition")
+			}
+			if test.expectDependencyError {
+				if condition.Status != metav1.ConditionFalse {
+					t.Errorf("expected ValidFeatureGates=False, got %s", condition.Status)
+				}
+				if !strings.Contains(condition.Message, sigPlacementDecisionDependencyMessage) {
+					t.Errorf("expected dependency message %q, got %q", sigPlacementDecisionDependencyMessage, condition.Message)
+				}
+			} else if condition.Status != metav1.ConditionTrue {
+				t.Errorf("expected ValidFeatureGates=True, got %s: %s", condition.Status, condition.Message)
+			}
+		})
+	}
+}
+
+func containsString(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
 }
 
 // TestSyncDeployWithTLSConfigGRPC verifies that TLS flags are injected into the
