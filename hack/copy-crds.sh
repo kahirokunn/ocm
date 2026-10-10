@@ -23,3 +23,6 @@ cp $CLUSTER_MANAGER_CRD_FILE ./deploy/cluster-manager/config/crds/
 cp $CLUSTER_MANAGER_CRD_FILE ./deploy/cluster-manager/chart/cluster-manager/crds/
 cp $KLUSTERLET_CRD_FILE ./deploy/klusterlet/config/crds/
 cp $KLUSTERLET_CRD_FILE ./deploy/klusterlet/chart/klusterlet/crds/
+
+cp "$CLUSTER_INVENTORY_CRD_FILE" \
+    ./manifests/cluster-manager/hub/crds/0000_00_multicluster.x-k8s.io_clusterprofiles.crd.yaml

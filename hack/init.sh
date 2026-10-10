@@ -21,3 +21,12 @@ SPOKE_CRD_FILES="./vendor/open-cluster-management.io/api/work/v1/0000_01_work.op
 
 CLUSTER_MANAGER_CRD_FILE="./vendor/open-cluster-management.io/api/operator/v1/0000_01_operator.open-cluster-management.io_clustermanagers.crd.yaml"
 KLUSTERLET_CRD_FILE="./vendor/open-cluster-management.io/api/operator/v1/0000_00_operator.open-cluster-management.io_klusterlets.crd.yaml"
+
+# Go vendoring omits CRD YAML that the dependency does not embed in a package.
+go mod download sigs.k8s.io/cluster-inventory-api
+CLUSTER_INVENTORY_MODULE_DIR=$(go list -mod=mod -m -f '{{.Dir}}' sigs.k8s.io/cluster-inventory-api)
+if [ -z "$CLUSTER_INVENTORY_MODULE_DIR" ]; then
+    echo "cluster-inventory-api source is unavailable; run go mod download sigs.k8s.io/cluster-inventory-api" >&2
+    exit 1
+fi
+CLUSTER_INVENTORY_CRD_FILE="$CLUSTER_INVENTORY_MODULE_DIR/config/crd/bases/multicluster.x-k8s.io_clusterprofiles.yaml"
