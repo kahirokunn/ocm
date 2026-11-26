@@ -2,6 +2,7 @@ package clusterprofile
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/openshift/library-go/pkg/operator/resource/resourcemerge"
@@ -9,6 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
@@ -17,6 +19,7 @@ import (
 	cpclientset "sigs.k8s.io/cluster-inventory-api/client/clientset/versioned"
 	cpinformerv1alpha2 "sigs.k8s.io/cluster-inventory-api/client/informers/externalversions/apis/v1alpha2"
 	cplisterv1alpha2 "sigs.k8s.io/cluster-inventory-api/client/listers/apis/v1alpha2"
+	"sigs.k8s.io/structured-merge-diff/v6/fieldpath"
 
 	informerv1 "open-cluster-management.io/api/client/cluster/informers/externalversions/cluster/v1"
 	listerv1 "open-cluster-management.io/api/client/cluster/listers/cluster/v1"
@@ -29,7 +32,8 @@ import (
 )
 
 const (
-	byClusterName = "by-cluster-name"
+	byClusterName      = "by-cluster-name"
+	statusFieldManager = "ocm-clusterprofile-status"
 )
 
 // clusterProfileStatusController updates ClusterProfile status and labels from ManagedCluster
@@ -186,30 +190,51 @@ func (c *clusterProfileStatusController) updateClusterProfile(
 	existing *cpv1alpha2.ClusterProfile,
 	cluster *v1.ManagedCluster) error {
 
-	// Create a patcher for this specific namespace
+	profiles := c.clusterProfileClient.ApisV1alpha2().ClusterProfiles(existing.Namespace)
 	profilePatcher := patcher.NewPatcher[
-		*cpv1alpha2.ClusterProfile, cpv1alpha2.ClusterProfileSpec, cpv1alpha2.ClusterProfileStatus](
-		c.clusterProfileClient.ApisV1alpha2().ClusterProfiles(existing.Namespace))
-
+		*cpv1alpha2.ClusterProfile, cpv1alpha2.ClusterProfileSpec, cpv1alpha2.ClusterProfileStatus](profiles)
 	newProfile := existing.DeepCopy()
-
-	// Sync status
-	syncStatusFromCluster(newProfile, cluster)
-
-	// Patch status first to avoid ResourceVersion conflict
-	// If status has been updated, return early - labels will be updated in next reconcile
-	updated, err := profilePatcher.PatchStatus(ctx, newProfile, newProfile.Status, existing.Status)
-	if updated {
+	syncLabelsFromCluster(newProfile, cluster)
+	// Sync labels independently of status ownership conflicts. The label update
+	// requeues this profile with the new resource version.
+	updated, err := profilePatcher.PatchLabelAnnotations(ctx, newProfile, newProfile.ObjectMeta, existing.ObjectMeta)
+	if updated || err != nil {
 		return err
 	}
 
-	// Status wasn't updated, now safe to patch labels
-	syncLabelsFromCluster(newProfile, cluster)
-
-	// Patch labels (patcher handles change detection)
-	_, err = profilePatcher.PatchLabelAnnotations(ctx, newProfile, newProfile.ObjectMeta, existing.ObjectMeta)
-
+	ownedFields, err := appliedStatusFields(existing)
+	if err != nil {
+		return fmt.Errorf("read applied ClusterProfile status fields: %w", err)
+	}
+	status := statusFromCluster(existing, cluster, ownedFields)
+	if ownedFields.Empty() && status.Version == nil && len(status.Properties) == 0 && len(status.Conditions) == 0 {
+		return nil
+	}
+	payload, err := json.Marshal(map[string]any{
+		"apiVersion": cpv1alpha2.GroupVersion.String(),
+		"kind":       cpv1alpha2.ClusterProfileKind,
+		"metadata": map[string]any{
+			"name": existing.Name, "namespace": existing.Namespace,
+			"uid": existing.UID, "resourceVersion": existing.ResourceVersion,
+		},
+		"status": status,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = profiles.Patch(ctx, existing.Name, types.ApplyPatchType, payload, metav1.PatchOptions{FieldManager: statusFieldManager}, "status")
 	return err
+}
+
+func appliedStatusFields(profile *cpv1alpha2.ClusterProfile) (*fieldpath.Set, error) {
+	fields := &fieldpath.Set{}
+	for _, entry := range profile.ManagedFields {
+		if entry.Manager == statusFieldManager && entry.Subresource == "status" &&
+			entry.Operation == metav1.ManagedFieldsOperationApply && entry.FieldsV1 != nil {
+			return fields, fields.FromJSON(entry.FieldsV1.GetRawReader())
+		}
+	}
+	return fields, nil
 }
 
 func syncLabelsFromCluster(profile *cpv1alpha2.ClusterProfile, cluster *v1.ManagedCluster) {
@@ -228,33 +253,40 @@ func syncLabelsFromCluster(profile *cpv1alpha2.ClusterProfile, cluster *v1.Manag
 	resourcemerge.MergeMap(&modified, &profile.Labels, requiredLabels)
 }
 
-func syncStatusFromCluster(profile *cpv1alpha2.ClusterProfile, cluster *v1.ManagedCluster) {
-	// Sync version
-	profile.Status.Version.Kubernetes = cluster.Status.Version.Kubernetes
+// A claim supplies only the property's name and value. Applying a full Property
+// would also send its zero lastObservedTime, which another writer may publish.
+type clusterProfileStatusApply struct {
+	Version    *cpv1alpha2.ClusterVersion `json:"version,omitempty"`
+	Properties []v1.ManagedClusterClaim   `json:"properties,omitempty"`
+	Conditions []metav1.Condition         `json:"conditions,omitempty"`
+}
 
-	// Sync properties from cluster claims
-	cpProperties := []cpv1alpha2.Property{}
-	for _, claim := range cluster.Status.ClusterClaims {
-		cpProperties = append(cpProperties, cpv1alpha2.Property{Name: claim.Name, Value: claim.Value})
+func statusFromCluster(profile *cpv1alpha2.ClusterProfile, cluster *v1.ManagedCluster, ownedFields *fieldpath.Set) clusterProfileStatusApply {
+	status := clusterProfileStatusApply{Properties: cluster.Status.ClusterClaims}
+	if version := cluster.Status.Version.Kubernetes; version != "" {
+		status.Version = &cpv1alpha2.ClusterVersion{Kubernetes: version}
 	}
-	profile.Status.Properties = cpProperties
-
-	// Sync conditions
-	if availableCondition := meta.FindStatusCondition(cluster.Status.Conditions, v1.ManagedClusterConditionAvailable); availableCondition != nil {
-		meta.SetStatusCondition(&profile.Status.Conditions, metav1.Condition{
-			Type:    cpv1alpha2.ClusterConditionControlPlaneHealthy,
-			Status:  availableCondition.Status,
-			Reason:  availableCondition.Reason,
-			Message: availableCondition.Message,
-		})
+	for _, mapping := range []struct{ source, target string }{
+		{v1.ManagedClusterConditionAvailable, cpv1alpha2.ClusterConditionControlPlaneHealthy},
+		{v1.ManagedClusterConditionJoined, "Joined"},
+	} {
+		source := meta.FindStatusCondition(cluster.Status.Conditions, mapping.source)
+		current := meta.FindStatusCondition(profile.Status.Conditions, mapping.target)
+		// Keep our last condition if the source disappears. A condition published
+		// solely by another manager must stay out of our apply configuration.
+		if current != nil {
+			conditionPath := fieldpath.MakePathOrDie("status", "conditions", fieldpath.KeyByFields("type", mapping.target))
+			if source != nil || ownedFields.Has(conditionPath) {
+				previous := *current
+				previous.ObservedGeneration = 0 // ManagedCluster does not report the ClusterProfile generation.
+				status.Conditions = append(status.Conditions, previous)
+			}
+		}
+		if source != nil {
+			meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+				Type: mapping.target, Status: source.Status, Reason: source.Reason, Message: source.Message,
+			})
+		}
 	}
-
-	if joinedCondition := meta.FindStatusCondition(cluster.Status.Conditions, v1.ManagedClusterConditionJoined); joinedCondition != nil {
-		meta.SetStatusCondition(&profile.Status.Conditions, metav1.Condition{
-			Type:    "Joined",
-			Status:  joinedCondition.Status,
-			Reason:  joinedCondition.Reason,
-			Message: joinedCondition.Message,
-		})
-	}
+	return status
 }

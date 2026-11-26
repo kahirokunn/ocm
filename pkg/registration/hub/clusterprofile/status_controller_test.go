@@ -11,6 +11,7 @@ import (
 	cpv1alpha2 "sigs.k8s.io/cluster-inventory-api/apis/v1alpha2"
 	cpfake "sigs.k8s.io/cluster-inventory-api/client/clientset/versioned/fake"
 	cpinformers "sigs.k8s.io/cluster-inventory-api/client/informers/externalversions"
+	"sigs.k8s.io/structured-merge-diff/v6/fieldpath"
 
 	clusterfake "open-cluster-management.io/api/client/cluster/clientset/versioned/fake"
 	clusterinformers "open-cluster-management.io/api/client/cluster/informers/externalversions"
@@ -659,31 +660,49 @@ func TestStatusSyncStatusFromCluster(t *testing.T) {
 		},
 	}
 
-	syncStatusFromCluster(profile, cluster)
+	status := statusFromCluster(profile, cluster, &fieldpath.Set{})
 
 	// Verify version
-	if profile.Status.Version.Kubernetes != "v1.28.0" {
-		t.Errorf("expected Kubernetes version v1.28.0, got %s", profile.Status.Version.Kubernetes)
+	if status.Version == nil || status.Version.Kubernetes != "v1.28.0" {
+		t.Errorf("expected Kubernetes version v1.28.0, got %v", status.Version)
 	}
 
 	// Verify properties
-	if len(profile.Status.Properties) != 2 {
-		t.Errorf("expected 2 properties, got %d", len(profile.Status.Properties))
+	if len(status.Properties) != 2 {
+		t.Errorf("expected 2 properties, got %d", len(status.Properties))
 	}
 
 	// Verify conditions
-	availableCondition := meta.FindStatusCondition(profile.Status.Conditions, cpv1alpha2.ClusterConditionControlPlaneHealthy)
+	availableCondition := meta.FindStatusCondition(status.Conditions, cpv1alpha2.ClusterConditionControlPlaneHealthy)
 	if availableCondition == nil {
 		t.Errorf("expected ControlPlaneHealthy condition")
 	} else if availableCondition.Status != metav1.ConditionTrue {
 		t.Errorf("expected ControlPlaneHealthy condition to be True, got %s", availableCondition.Status)
 	}
 
-	joinedCondition := meta.FindStatusCondition(profile.Status.Conditions, "Joined")
+	joinedCondition := meta.FindStatusCondition(status.Conditions, "Joined")
 	if joinedCondition == nil {
 		t.Errorf("expected Joined condition")
 	} else if joinedCondition.Status != metav1.ConditionTrue {
 		t.Errorf("expected Joined condition to be True, got %s", joinedCondition.Status)
+	}
+}
+
+func TestStatusKeepsPreviouslyReportedConditionWhenClusterConditionIsMissing(t *testing.T) {
+	lastTransition := metav1.Now()
+	health := metav1.Condition{
+		Type: cpv1alpha2.ClusterConditionControlPlaneHealthy, Status: metav1.ConditionTrue,
+		Reason: "Available", LastTransitionTime: lastTransition,
+	}
+	profile := &cpv1alpha2.ClusterProfile{
+		Status: cpv1alpha2.ClusterProfileStatus{Conditions: []metav1.Condition{
+			health, {Type: "Joined", Status: metav1.ConditionTrue, Reason: "External", LastTransitionTime: lastTransition},
+		}},
+	}
+	ownedFields := fieldpath.NewSet(fieldpath.MakePathOrDie("status", "conditions", fieldpath.KeyByFields("type", health.Type)))
+	status := statusFromCluster(profile, &v1.ManagedCluster{}, ownedFields)
+	if len(status.Conditions) != 1 || status.Conditions[0] != health {
+		t.Fatalf("expected only the previously reported health condition, got %v", status.Conditions)
 	}
 }
 

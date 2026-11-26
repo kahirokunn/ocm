@@ -846,6 +846,58 @@ var _ = ginkgo.Describe("ClusterProfile", func() {
 
 			return nil
 		}, eventuallyTimeout, eventuallyInterval).Should(gomega.Succeed())
+
+		ginkgo.By("Publish additional status from another field manager")
+		profiles := clusterProfileClient.ApisV1alpha2().ClusterProfiles(namespace)
+		externalStatus := []byte(fmt.Sprintf(`{
+			"apiVersion":"multicluster.x-k8s.io/v1alpha2", "kind":"ClusterProfile",
+			"metadata":{"name":%q,"namespace":%q},
+			"status":{
+				"properties":[{"name":"tenant","value":"blue"}],
+				"conditions":[{"type":"TenantReady","status":"True","reason":"Configured","message":"","lastTransitionTime":"2025-06-01T00:00:00Z"}],
+				"accessProviders":[{"name":"tenant","cluster":{"server":"https://tenant.example.com"}}]
+			}
+		}`, clusterName, namespace))
+		external, err := profiles.Patch(context.Background(), clusterName, types.ApplyPatchType, externalStatus,
+			metav1.PatchOptions{FieldManager: "tenant-controller"}, "status")
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+		ginkgo.By("Add, update and remove claims while keeping the other manager's entries")
+		_, err = clusterClient.ClusterV1().ManagedClusters().Patch(context.Background(), clusterName, types.MergePatchType,
+			[]byte(`{"status":{"clusterClaims":[{"name":"platform","value":"aws"},{"name":"zone","value":"west"}]}}`),
+			metav1.PatchOptions{}, "status")
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Eventually(func(g gomega.Gomega) {
+			profile, err := profiles.Get(context.Background(), clusterName, metav1.GetOptions{})
+			g.Expect(err).NotTo(gomega.HaveOccurred())
+			g.Expect(profile.Status.Properties).To(gomega.ConsistOf(
+				cpv1alpha2.Property{Name: "platform", Value: "aws"},
+				cpv1alpha2.Property{Name: "zone", Value: "west"},
+				cpv1alpha2.Property{Name: "tenant", Value: "blue"},
+			))
+			g.Expect(meta.FindStatusCondition(profile.Status.Conditions, "TenantReady")).To(gomega.Equal(
+				meta.FindStatusCondition(external.Status.Conditions, "TenantReady")))
+			g.Expect(profile.Status.AccessProviders).To(gomega.Equal(external.Status.AccessProviders))
+		}, eventuallyTimeout, eventuallyInterval).Should(gomega.Succeed())
+
+		ginkgo.By("Reject a different writer changing an OCM claim")
+		conflictingStatus := []byte(fmt.Sprintf(`{
+			"apiVersion":"multicluster.x-k8s.io/v1alpha2", "kind":"ClusterProfile",
+			"metadata":{"name":%q,"namespace":%q}, "status":{"properties":[{"name":"platform","value":"other"}]}
+		}`, clusterName, namespace))
+		_, err = profiles.Patch(context.Background(), clusterName, types.ApplyPatchType, conflictingStatus,
+			metav1.PatchOptions{FieldManager: "another-controller"}, "status")
+		gomega.Expect(errors.IsConflict(err)).To(gomega.BeTrue(), "unexpected error: %v", err)
+
+		ginkgo.By("Remove the last OCM claims while preserving the external property")
+		_, err = clusterClient.ClusterV1().ManagedClusters().Patch(context.Background(), clusterName, types.MergePatchType,
+			[]byte(`{"status":{"clusterClaims":[]}}`), metav1.PatchOptions{}, "status")
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Eventually(func(g gomega.Gomega) {
+			profile, err := profiles.Get(context.Background(), clusterName, metav1.GetOptions{})
+			g.Expect(err).NotTo(gomega.HaveOccurred())
+			g.Expect(profile.Status.Properties).To(gomega.ConsistOf(cpv1alpha2.Property{Name: "tenant", Value: "blue"}))
+		}, eventuallyTimeout, eventuallyInterval).Should(gomega.Succeed())
 	})
 
 	ginkgo.It("should create ClusterProfiles with global clusterset (empty LabelSelector)", func() {
